@@ -893,7 +893,7 @@ def lohrbench_rlds_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, An
         lang = trajectory["traj_metadata"]["language_instruction"]  # scalar string
         T = tf.shape(trajectory["action"])[0]
         trajectory["language_instruction"] = tf.fill([T], lang)
-
+    lang = trajectory["language_instruction"]
     return trajectory
 
 # === Registry ===

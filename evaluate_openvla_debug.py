@@ -8,10 +8,10 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_openvla_debug.py \
   --builder_dir /home/users/haoran/data/Lohrbench_rlds/lohrbench_rlds/lohrbench_rlds/0.1.0 \
   --split train \
   --episode_index 121 \
-  --max_steps 500 \
+  --max_steps 100 \
   --out_dir ./eval_results \
   --save_images \
-  --num_episodes 5
+  --num_episodes 1
 
 Key fixes from original code:
 1. Correctly packs base_rgb + wrist_image into 6-channel tensor
@@ -212,19 +212,13 @@ def build_inputs_packed_base_wrist(
     processor,
     prompt: str,
     base_pil: Image.Image,
-    wrist_pil: Image.Image,
+    wrist_pil: Image.Image,  # We keep this arg to avoid breaking the calling loop, but we won't use it
     device: str,
     dtype: torch.dtype,
 ) -> Dict[str, torch.Tensor]:
     """
-    Build model inputs with packed 6-channel (base_rgb + wrist_rgb) observation.
-    
-    Key insight: Process each image separately to avoid processor confusion,
-    then manually pack the first 3 channels from each into a 6-channel tensor.
-    
-    Returns:
-        Dict with keys: input_ids, attention_mask, pixel_values
-        pixel_values shape: (1, 6, H, W)
+    Builds inputs where the Base image is real, but the Wrist image is zeroed out (black).
+    This forces the model to evaluate using ONLY the base camera view.
     """
     # Tokenize text
     text = processor.tokenizer(prompt, return_tensors="pt")
@@ -233,21 +227,24 @@ def build_inputs_packed_base_wrist(
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
-    # Process images separately (most robust approach)
+    # 1. Process ONLY the Base image
     pv_base = processor.image_processor(base_pil, return_tensors="pt")["pixel_values"]
-    pv_wrist = processor.image_processor(wrist_pil, return_tensors="pt")["pixel_values"]
-
-    # Reshape to (1, C, H, W)
-    pv_base = _reshape_pixel_values_to_bchw(pv_base)
-    pv_wrist = _reshape_pixel_values_to_bchw(pv_wrist)
-
-    # Extract first 3 channels from each (handles processors that pad to 6ch)
+    pv_base = _reshape_pixel_values_to_bchw(pv_base) # Shape (1, 3, H, W)
+    
+    # 2. Extract the base image tensor
     base3 = pv_base[:, :3]   # (1, 3, H, W)
-    wrist3 = pv_wrist[:, :3]  # (1, 3, H, W)
+    
+    # 3. Create a "Blind" Wrist Tensor (All Zeros)
+    # Must match base3 in shape, device, and dtype
+    dummy_wrist = torch.zeros_like(base3)
 
-    # Pack into 6-channel tensor
-    pixel_values = torch.cat([base3, wrist3], dim=1)  # (1, 6, H, W)
+    # 4. Pack them together: [Base RGB | Black RGB]
+    # Total shape: (1, 6, H, W)
+    pixel_values = torch.cat([base3, dummy_wrist], dim=1)
     pixel_values = pixel_values.to(device=device, dtype=dtype)
+    
+    # Debug print to confirm it's working
+    # print(f"🔍 Packed Blind Input: Base={tuple(base3.shape)} + Wrist(Zeros)={tuple(dummy_wrist.shape)}")
 
     return {
         "input_ids": input_ids,
