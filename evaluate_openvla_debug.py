@@ -1,57 +1,100 @@
 #!/usr/bin/env python3
 """
-Evaluation script for OpenVLA-OFT model on Lohrbench RLDS dataset.
+Evaluate OpenVLA finetuned with LoRA + L1 regression head (finetune.py default).
 
-Usage:
-CUDA_VISIBLE_DEVICES=0 python evaluate_openvla_debug.py \
-  --ckpt /home/users/haoran/runs/openvla_oft_lohrbench/openvla-7b+lohrbench_rlds+b16+lr-0.0005+lora-r32+dropout-0.0--lohrbench_lora_r32_bs1x2_ga16--40000_chkpt \
-  --builder_dir /home/users/haoran/data/Lohrbench_rlds/lohrbench_rlds/lohrbench_rlds/0.1.0 \
+This script:
+- Loads base model from checkpoint dir
+- Loads LoRA adapter from ckpt_dir/lora_adapter (optional merge)
+- Loads action_head--{step}_checkpoint.pt (CRITICAL for L1 regression training)
+- Evaluates on RLDS TFDS episodes
+
+Example:
+export OPENVLA_ROOT="/home/haoran-zhang/openvla/LOHRbench_Openvla/openvla-oft"
+
+TF_FORCE_GPU_ALLOW_GROWTH=true CUDA_VISIBLE_DEVICES=0 python evaluate_openvla_lora_l1.py \
+  --ckpt /home/haoran-zhang/openvla/LOHRbench_Openvla/openvla-oft/openvla/openvla-7b+lohrbench_rlds+b8+lr-0.0005+lora-r32+dropout-0.0--lohrbench_lora_r32_bs2x1_ga32--50000_chkpt \
+  --builder_dir /home/haoran-zhang/data/Lohrbench_rlds/lohrbench_rlds/lohrbench_rlds/0.1.0 \
   --split train \
-  --episode_index 121 \
+  --episode_index 371 \
+  --num_episodes 1 \
   --max_steps 100 \
-  --out_dir ./eval_results \
-  --save_images \
-  --num_episodes 1
-
-Key fixes from original code:
-1. Correctly packs base_rgb + wrist_image into 6-channel tensor
-2. Properly extracts 8D state from 9D qpos (7 joints + mean of 2 fingers)
-3. Handles processor that may return 6ch per image (padding secondary)
-4. Sets num_images_in_input=1 for packed observation
+  --out_dir ./eval_results_debug \
+  --num_images_in_input 2 \
+  --merge_lora \
+  --step 50000
 """
 
 from __future__ import annotations
 
-import argparse
 import os
-from typing import Any, Dict, List, Optional
+import re
+import sys
+import argparse
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
-from PIL import Image
+
+# TF only for TFDS reading; avoid touching GPU
+import tensorflow as tf
+try:
+    tf.config.set_visible_devices([], "GPU")
+except Exception:
+    pass
 import tensorflow_datasets as tfds
-from transformers import AutoModelForVision2Seq, AutoProcessor
+
+from PIL import Image
 import matplotlib.pyplot as plt
 
 
-# ============================================================================
-# Utilities
-# ============================================================================
+# =============================================================================
+# Locate OPENVLA_ROOT and import repo utilities
+# =============================================================================
+def find_openvla_root() -> str:
+    root = os.environ.get("OPENVLA_ROOT")
+    if root and os.path.exists(root):
+        return root
+    script_path = Path(__file__).resolve()
+    cur = script_path.parent
+    for _ in range(10):
+        if (cur / "experiments" / "robot").exists():
+            return str(cur)
+        cur = cur.parent
+    raise RuntimeError(
+        "Could not find openvla-oft repo root. Please set OPENVLA_ROOT=/path/to/openvla-oft"
+    )
 
-def make_prompt(instruction: str) -> str:
-    """Format instruction into VLA prompt."""
-    return f"In: What action should the robot take to {instruction}?\nOut:"
+
+OPENVLA_ROOT = find_openvla_root()
+sys.path.insert(0, OPENVLA_ROOT)
+print(f"✓ Added to Python path: {OPENVLA_ROOT}")
+
+# Repo utils (these avoid the processor batching issues you hit)
+from experiments.robot.openvla_utils import (  # noqa: E402
+    get_vla,
+    get_processor,
+)
+from experiments.robot.robot_utils import (  # noqa: E402
+    get_action,
+    set_seed_everywhere,
+)
+from prismatic.models.action_heads import L1RegressionActionHead  # noqa: E402
+from prismatic.models.projectors import ProprioProjector  # noqa: E402
+from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, PROPRIO_DIM  # noqa: E402
+from peft import PeftModel  # noqa: E402
 
 
+# =============================================================================
+# Small helpers
+# =============================================================================
 def decode_text(x: Any) -> str:
-    """Decode bytes/bytearray to string."""
     if isinstance(x, (bytes, bytearray, np.bytes_)):
         return x.decode("utf-8", errors="replace")
     return str(x)
 
 
 def uint8_image(x: Any) -> np.ndarray:
-    """Ensure image is uint8 numpy array."""
     x = np.asarray(x)
     if x.dtype != np.uint8:
         x = np.clip(x, 0, 255).astype(np.uint8)
@@ -59,561 +102,369 @@ def uint8_image(x: Any) -> np.ndarray:
 
 
 def pack_state_from_qpos(qpos_9: Any) -> np.ndarray:
-    """
-    Transform 9D qpos to 8D state matching lohrbench_rlds_dataset_transform:
-      state = [qpos[:7], mean(qpos[7:9])]
-    
-    Args:
-        qpos_9: Array with shape (..., 9) containing [7 joints, 2 finger positions]
-    
-    Returns:
-        state: Array with shape (..., 8) containing [7 joints, 1 gripper]
-    """
+    """9D qpos -> 8D state: [qpos[:7], mean(qpos[7:9])]"""
     qpos_9 = np.asarray(qpos_9, dtype=np.float32)
     if qpos_9.shape[-1] != 9:
         raise ValueError(f"Expected qpos last dim=9, got {qpos_9.shape}")
-    
     joints7 = qpos_9[..., :7]
     gripper1 = np.mean(qpos_9[..., 7:9], axis=-1, keepdims=True)
     return np.concatenate([joints7, gripper1], axis=-1).astype(np.float32)
 
 
 def summarize_vec(name: str, x: np.ndarray) -> None:
-    """Print statistics for array."""
     x = np.asarray(x)
     print(
-        f"{name}: shape={x.shape} "
-        f"min={x.min():.4f} max={x.max():.4f} "
+        f"{name}: shape={x.shape} min={x.min():.4f} max={x.max():.4f} "
         f"mean={x.mean():.4f} std={x.std():.4f}",
         flush=True,
     )
 
 
-# ============================================================================
-# Model utilities
-# ============================================================================
-
-def try_set_num_images_in_input(vla, n: int) -> bool:
-    """
-    Set num_images_in_input on vision backbone if available.
-    For packed 6-channel (base+wrist), we want n=1.
-    """
-    candidates = []
-    if hasattr(vla, "model"):
-        candidates.append(getattr(vla.model, "vision_backbone", None))
-        candidates.append(getattr(vla.model, "vision_tower", None))
-    candidates.append(getattr(vla, "vision_backbone", None))
-    candidates.append(getattr(vla, "vision_tower", None))
-
-    for vb in candidates:
-        if vb is not None and hasattr(vb, "set_num_images_in_input"):
-            vb.set_num_images_in_input(n)
-            return True
-    return False
-
-
-def to_numpy_action(pred) -> np.ndarray:
-    """Convert model prediction to (D,) numpy array."""
-    # Handle dict outputs
-    if isinstance(pred, dict):
-        for k in ["actions", "action", "pred_actions", "pred_action"]:
-            if k in pred:
-                pred = pred[k]
-                break
+def remove_ddp_prefix(state_dict: dict) -> dict:
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            out[k[len("module."):]] = v
         else:
-            pred = next(iter(pred.values()))
-
-    # Handle tuple/list
-    if isinstance(pred, (tuple, list)):
-        pred = pred[0]
-
-    # Convert to numpy
-    if torch.is_tensor(pred):
-        pred = pred.detach().float().cpu().numpy()
-    else:
-        pred = np.asarray(pred, dtype=np.float32)
-
-    # Handle action chunks (T, D) -> take first timestep
-    if pred.ndim >= 2:
-        pred = pred[0]
-
-    return pred.astype(np.float32).reshape(-1)
+            out[k] = v
+    return out
 
 
-def predict_action_with_proprio(
-    vla,
-    inputs: Dict[str, torch.Tensor],
-    proprio_np: Optional[np.ndarray],
-    device: str,
-    unnorm_key: Optional[str],
-    verbose: bool = False,
-):
+def infer_step_from_ckpt_name(ckpt_dir: Path) -> int | None:
     """
-    Call vla.predict_action with proprioception.
-    Tries multiple common argument names for proprio.
+    If ckpt dir name ends with --{step}_chkpt, extract step.
     """
-    kwargs = dict(inputs)
-    
-    if proprio_np is not None:
-        proprio_np = np.asarray(proprio_np, dtype=np.float32).reshape(1, -1)
-        proprio_t = torch.from_numpy(proprio_np).to(device)
-
-        # Try common proprio argument names
-        for k in ["proprio", "state", "robot_state"]:
-            try:
-                out = vla.predict_action(
-                    **kwargs,
-                    **{k: proprio_t},
-                    unnorm_key=unnorm_key,
-                    do_sample=False
-                )
-                if verbose:
-                    print(f"✓ predict_action accepted proprio key='{k}' shape={tuple(proprio_t.shape)}")
-                return out
-            except TypeError:
-                if verbose:
-                    print(f"✗ predict_action rejected proprio key='{k}'")
-                continue
-
-        if verbose:
-            print("⚠ No proprio key accepted, running without proprio")
-
-    return vla.predict_action(**kwargs, unnorm_key=unnorm_key, do_sample=False)
-
-
-# ============================================================================
-# Image packing (critical fix)
-# ============================================================================
-
-def _reshape_pixel_values_to_bchw(pv: torch.Tensor) -> torch.Tensor:
-    """
-    Reshape pixel_values to (B, C, H, W).
-    
-    Handles:
-      - (B, C, H, W) -> unchanged
-      - (B, N, 3, H, W) -> (B, 3N, H, W)
-      - (N, 3, H, W) -> (1, 3N, H, W)
-    """
-    if pv.ndim == 5:
-        b, n, c, h, w = pv.shape
-        return pv.reshape(b, n * c, h, w)
-    
-    if pv.ndim == 4:
-        # Check if (N, 3, H, W) without batch dim
-        if pv.shape[0] in (2, 3) and pv.shape[1] == 3:
-            n, c, h, w = pv.shape
-            return pv.reshape(1, n * c, h, w)
-        return pv
-    
-    raise ValueError(f"Unexpected pixel_values ndim={pv.ndim}, shape={tuple(pv.shape)}")
-
-
-def build_inputs_packed_base_wrist(
-    processor,
-    prompt: str,
-    base_pil: Image.Image,
-    wrist_pil: Image.Image,  # We keep this arg to avoid breaking the calling loop, but we won't use it
-    device: str,
-    dtype: torch.dtype,
-) -> Dict[str, torch.Tensor]:
-    """
-    Builds inputs where the Base image is real, but the Wrist image is zeroed out (black).
-    This forces the model to evaluate using ONLY the base camera view.
-    """
-    # Tokenize text
-    text = processor.tokenizer(prompt, return_tensors="pt")
-    input_ids = text["input_ids"].to(device)
-    attention_mask = text.get("attention_mask")
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
-
-    # 1. Process ONLY the Base image
-    pv_base = processor.image_processor(base_pil, return_tensors="pt")["pixel_values"]
-    pv_base = _reshape_pixel_values_to_bchw(pv_base) # Shape (1, 3, H, W)
-    
-    # 2. Extract the base image tensor
-    base3 = pv_base[:, :3]   # (1, 3, H, W)
-    
-    # 3. Create a "Blind" Wrist Tensor (All Zeros)
-    # Must match base3 in shape, device, and dtype
-    dummy_wrist = torch.zeros_like(base3)
-
-    # 4. Pack them together: [Base RGB | Black RGB]
-    # Total shape: (1, 6, H, W)
-    pixel_values = torch.cat([base3, dummy_wrist], dim=1)
-    pixel_values = pixel_values.to(device=device, dtype=dtype)
-    
-    # Debug print to confirm it's working
-    # print(f"🔍 Packed Blind Input: Base={tuple(base3.shape)} + Wrist(Zeros)={tuple(dummy_wrist.shape)}")
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "pixel_values": pixel_values,
-    }
-
-
-# ============================================================================
-# Metrics and visualization
-# ============================================================================
-
-def print_error_summary(gt_arr: np.ndarray, pred_arr: np.ndarray) -> None:
-    """Print detailed error statistics."""
-    if gt_arr.shape != pred_arr.shape:
-        raise ValueError(f"Shape mismatch: gt {gt_arr.shape} vs pred {pred_arr.shape}")
-
-    err = (pred_arr - gt_arr).astype(np.float64)
-    abs_err = np.abs(err)
-    mse = err ** 2
-
-    mae_per_dim = abs_err.mean(axis=0)
-    rmse_per_dim = np.sqrt(mse.mean(axis=0))
-    max_abs_per_dim = abs_err.max(axis=0)
-
-    print("\n" + "=" * 60)
-    print("ERROR SUMMARY (pred - gt)")
-    print("=" * 60)
-    print(f"Steps: {gt_arr.shape[0]}  |  Dims: {gt_arr.shape[1]}")
-    print(f"Mean MAE:  {float(mae_per_dim.mean()):.6f}")
-    print(f"Mean RMSE: {float(rmse_per_dim.mean()):.6f}")
-    print(f"Max |err|: {float(abs_err.max()):.6f}")
-
-    print("\nPer-dimension errors:")
-    print(f"{'Dim':<6} {'MAE':<12} {'RMSE':<12} {'Max|err|':<12}")
-    print("-" * 48)
-    for d in range(gt_arr.shape[1]):
-        print(
-            f"{d:<6} {mae_per_dim[d]:<12.6f} "
-            f"{rmse_per_dim[d]:<12.6f} {max_abs_per_dim[d]:<12.6f}"
-        )
-
-
-def plot_debug(gt: np.ndarray, pred: np.ndarray, out_dir: str):
-    """Generate debug plots comparing GT and predicted actions."""
-    os.makedirs(out_dir, exist_ok=True)
-    T, D = gt.shape
-    x = np.arange(T)
-
-    # Per-dimension plots
-    for d in range(D):
-        plt.figure(figsize=(10, 6))
-        plt.plot(x, gt[:, d], 'b-', label='Ground Truth', linewidth=2)
-        plt.plot(x, pred[:, d], 'r--', label='Predicted', linewidth=2)
-        plt.xlabel('Timestep', fontsize=12)
-        plt.ylabel(f'Action Dim {d}', fontsize=12)
-        plt.title(f'Action Dimension {d}: GT vs Predicted', fontsize=14)
-        plt.legend(fontsize=10)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"action_dim{d:02d}.png"), dpi=100)
-        plt.close()
-
-    # L2 error plot
-    l2_err = np.linalg.norm(pred - gt, axis=1)
-    plt.figure(figsize=(10, 6))
-    plt.plot(x, l2_err, 'r-', linewidth=2)
-    plt.xlabel('Timestep', fontsize=12)
-    plt.ylabel('L2 Error', fontsize=12)
-    plt.title('Per-step L2 Error: ||pred - gt||₂', fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "action_l2_error.png"), dpi=100)
-    plt.close()
-
-    print(f"✅ Saved {D + 1} debug plots to: {out_dir}")
+    m = re.search(r"--(\d+)_chkpt$", ckpt_dir.name)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def save_images(
     base_frames: List[np.ndarray],
     wrist_frames: List[np.ndarray],
     out_dir: str,
-    stride: int,
-    max_frames: int,
+    stride: int = 50,
+    max_frames: int = 30,
 ):
-    """Save sample frames from episode."""
     os.makedirs(out_dir, exist_ok=True)
     T = min(len(base_frames), len(wrist_frames))
     idxs = list(range(0, T, max(1, stride)))[:max_frames]
-    
     for t in idxs:
-        Image.fromarray(base_frames[t]).save(
-            os.path.join(out_dir, f"base_t{t:04d}.png")
-        )
-        Image.fromarray(wrist_frames[t]).save(
-            os.path.join(out_dir, f"wrist_t{t:04d}.png")
-        )
-    
+        Image.fromarray(base_frames[t]).save(os.path.join(out_dir, f"base_t{t:04d}.png"))
+        Image.fromarray(wrist_frames[t]).save(os.path.join(out_dir, f"wrist_t{t:04d}.png"))
     print(f"✅ Saved {len(idxs)} image pairs to: {out_dir}")
 
 
-# ============================================================================
-# Episode evaluation
-# ============================================================================
+def plot_debug(gt: np.ndarray, pred: np.ndarray, out_dir: str):
+    os.makedirs(out_dir, exist_ok=True)
+    T, D = gt.shape
+    x = np.arange(T)
 
-def evaluate_episode(
-    vla,
-    processor,
-    steps_list: List[Dict],
-    device: str,
-    torch_dtype: torch.dtype,
-    unnorm_key: str,
-    max_steps: int,
-    print_first_k: int,
-    save_imgs: bool,
-) -> tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
-    """
-    Evaluate model on a single episode.
-    
-    Returns:
-        gt_arr: Ground truth actions (T, D)
-        pred_arr: Predicted actions (T, D)
-        base_frames: List of base RGB frames
-        wrist_frames: List of wrist RGB frames
-    """
-    # Get instruction from first step
-    instruction = decode_text(steps_list[0]["language_instruction"])
-    prompt = make_prompt(instruction)
-    print(f"\n📋 Instruction: {instruction}")
+    for d in range(D):
+        plt.figure(figsize=(10, 5))
+        plt.plot(x, gt[:, d], label="GT")
+        plt.plot(x, pred[:, d], linestyle="--", label="Pred")
+        plt.xlabel("t")
+        plt.ylabel(f"dim {d}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"dim_{d:02d}.png"), dpi=120)
+        plt.close()
 
-    gt_list = []
-    pred_list = []
-    base_frames = []
-    wrist_frames = []
+    plt.figure(figsize=(10, 5))
+    plt.plot(x, np.linalg.norm(pred - gt, axis=1))
+    plt.xlabel("t")
+    plt.ylabel("L2 error")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "l2.png"), dpi=120)
+    plt.close()
 
-    verbose_accept = True
-    T = min(len(steps_list), max_steps)
 
-    for t in range(T):
-        step = steps_list[t]
-        obs = step["observation"]
+def print_error_summary(gt_arr: np.ndarray, pred_arr: np.ndarray) -> None:
+    err = (pred_arr - gt_arr).astype(np.float64)
+    abs_err = np.abs(err)
+    mse = err ** 2
+    mae = abs_err.mean(axis=0)
+    rmse = np.sqrt(mse.mean(axis=0))
+    print(f"Mean MAE:  {mae.mean():.6f}")
+    print(f"Mean RMSE: {rmse.mean():.6f}")
+    print(f"Max |err|: {abs_err.max():.6f}")
+    for d in range(gt_arr.shape[1]):
+        print(f"  dim {d}: MAE {mae[d]:.6f} RMSE {rmse[d]:.6f} Max {abs_err[:, d].max():.6f}")
 
-        # Get images
-        base_np = uint8_image(obs["base_rgb"])
-        wrist_np = uint8_image(obs["hand_rgb"])
 
-        if save_imgs:
-            base_frames.append(base_np)
-            wrist_frames.append(wrist_np)
+# =============================================================================
+# EvalConfig compatible with get_vla/get_action
+# =============================================================================
+class EvalConfig:
+    def __init__(self, args):
+        self.pretrained_checkpoint = args.ckpt
+        self.model_family = "openvla"
 
-        # Get state from qpos (9D -> 8D)
-        if "qpos" not in obs:
-            raise KeyError(f"'qpos' not in observation keys: {list(obs.keys())}")
-        state = pack_state_from_qpos(obs["qpos"])  # (8,)
+        self.num_images_in_input = args.num_images_in_input
+        self.image_size = 224
+        self.use_fused_vision_backbone = True
+        self.center_crop = args.center_crop
 
-        # Get ground truth action
-        gt = np.asarray(step["action"], dtype=np.float32).reshape(-1)
+        self.unnorm_key = args.unnorm_key if args.unnorm_key != "None" else None
 
-        # Build packed inputs
-        inputs = build_inputs_packed_base_wrist(
-            processor,
-            prompt,
-            Image.fromarray(base_np),
-            Image.fromarray(wrist_np),
-            device,
-            torch_dtype,
+        # MATCH finetune.py defaults unless user overrides
+        self.use_proprio = args.use_proprio
+        self.use_film = args.use_film
+        self.use_l1_regression = True          # finetune.py default
+        self.use_diffusion = False
+
+        self.load_in_8bit = False
+        self.load_in_4bit = False
+        self.device = args.device
+        self.dtype = args.dtype
+        self.attn_implementation = "sdpa"
+
+
+# =============================================================================
+# Load model + LoRA + action head (+ optional proprio projector)
+# =============================================================================
+def load_model_and_modules(cfg: EvalConfig, step: int, merge_lora: bool):
+    print(f"\n🤖 Loading base model via get_vla(cfg) from: {cfg.pretrained_checkpoint}")
+    vla = get_vla(cfg)
+
+    # Ensure correct number of images in input (training did this)
+    if hasattr(vla, "vision_backbone"):
+        try:
+            vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+        except Exception:
+            pass
+
+    # Attach LoRA if present
+    ckpt_dir = Path(cfg.pretrained_checkpoint)
+    adapter_dir = ckpt_dir / "lora_adapter"
+    if adapter_dir.exists():
+        print(f"✅ Found LoRA adapter: {adapter_dir}")
+        vla = PeftModel.from_pretrained(vla, str(adapter_dir))
+        if merge_lora:
+            print("🔧 Merging LoRA (merge_and_unload) ...")
+            vla = vla.merge_and_unload()
+    else:
+        print("ℹ️  No lora_adapter found; assuming ckpt already merged or non-LoRA.")
+
+    vla.eval()
+
+    processor = get_processor(cfg)
+
+    # Load action_head (CRITICAL for your training setup)
+    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[cfg.dtype]
+    action_head = L1RegressionActionHead(
+        input_dim=vla.llm_dim, hidden_dim=vla.llm_dim, action_dim=ACTION_DIM
+    ).to(cfg.device).to(torch_dtype)
+    head_path = ckpt_dir / f"action_head--{step}_checkpoint.pt"
+    if not head_path.exists():
+        raise FileNotFoundError(
+            f"Missing {head_path}\n"
+            f"Your finetune.py default use_l1_regression=True, so this file must exist for correct eval."
+        )
+    sd = torch.load(str(head_path), map_location="cpu")
+    if isinstance(sd, dict):
+        sd = remove_ddp_prefix(sd)
+    action_head.load_state_dict(sd)
+    action_head.eval()
+    print(f"✅ Loaded action_head from: {head_path}")
+
+    # Optional proprio projector (only if you actually trained with --use_proprio True)
+    proprio_projector = None
+    if cfg.use_proprio:
+        pp_path = ckpt_dir / f"proprio_projector--{step}_checkpoint.pt"
+        if not pp_path.exists():
+            raise FileNotFoundError(
+                f"--use_proprio was set, but missing {pp_path}. "
+                f"Train/eval must match: finetune.py default use_proprio=False."
+            )
+        proprio_projector = ProprioProjector(llm_dim=vla.llm_dim, proprio_dim=PROPRIO_DIM).to(cfg.device).to(torch_dtype)
+        pp_sd = torch.load(str(pp_path), map_location="cpu")
+        proprio_projector.load_state_dict(remove_ddp_prefix(pp_sd))
+        proprio_projector.eval()
+        print(f"✅ Loaded proprio_projector from: {pp_path}")
+
+    return vla, processor, action_head, proprio_projector
+
+
+# =============================================================================
+# Main evaluation
+# =============================================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True, help="Checkpoint directory (--XXXX_chkpt dir)")
+    ap.add_argument("--builder_dir", required=True)
+    ap.add_argument("--split", default="train")
+    ap.add_argument("--episode_index", type=int, default=0)
+    ap.add_argument("--num_episodes", type=int, default=1)
+    ap.add_argument("--max_steps", type=int, default=100)
+    ap.add_argument("--out_dir", default="./eval_results_debug")
+
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+
+    ap.add_argument("--unnorm_key", default="lohrbench_rlds")
+    ap.add_argument("--num_images_in_input", type=int, default=2)
+    ap.add_argument("--center_crop", action="store_true")
+
+    ap.add_argument("--use_proprio", action="store_true", help="ONLY if you trained with use_proprio=True")
+    ap.add_argument("--use_film", action="store_true", help="ONLY if you trained with use_film=True")
+
+    ap.add_argument("--merge_lora", action="store_true")
+    ap.add_argument("--save_images", action="store_true")
+    ap.add_argument("--img_stride", type=int, default=50)
+    ap.add_argument("--img_max_frames", type=int, default=30)
+
+    ap.add_argument("--seed", type=int, default=42)
+
+    # Must match file names action_head--{step}_checkpoint.pt
+    ap.add_argument("--step", type=int, default=None, help="Training step (e.g. 50000). If omitted, infer from ckpt dir name.")
+    args = ap.parse_args()
+
+    set_seed_everywhere(args.seed)
+
+    ckpt_dir = Path(args.ckpt)
+    step = args.step if args.step is not None else infer_step_from_ckpt_name(ckpt_dir)
+    if step is None:
+        raise ValueError(
+            "Could not infer --step from ckpt dir name. Please pass --step 50000 (or correct step)."
         )
 
-        # Print shapes on first step
-        if t == 0:
-            pv = inputs["pixel_values"]
-            print(f"\n🔍 First step shapes:")
-            print(f"  pixel_values: {tuple(pv.shape)} (expected: (1, 6, H, W))")
-            print(f"  state: {state.shape} (expected: (8,))")
-            print(f"  action: {gt.shape}")
-            summarize_vec("  state", state)
-            summarize_vec("  gt_action", gt)
-
-        # Predict action
-        with torch.no_grad():
-            pred_raw = predict_action_with_proprio(
-                vla=vla,
-                inputs=inputs,
-                proprio_np=state,
-                device=device,
-                unnorm_key=unnorm_key,
-                verbose=verbose_accept,
-            )
-        verbose_accept = False
-
-        pred = to_numpy_action(pred_raw)
-
-        gt_list.append(gt)
-        pred_list.append(pred)
-
-        # Print first few steps
-        if t < print_first_k:
-            print(f"\n[t={t}]")
-            summarize_vec("  gt", gt)
-            summarize_vec("  pred", pred)
-            print(f"  gt[:8]:   {np.round(gt[:8], 3)}")
-            print(f"  pred[:8]: {np.round(pred[:8], 3)}")
-
-    gt_arr = np.stack(gt_list, axis=0)
-    pred_arr = np.stack(pred_list, axis=0)
-
-    return gt_arr, pred_arr, base_frames, wrist_frames
-
-
-# ============================================================================
-# Main
-# ============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate OpenVLA-OFT model on Lohrbench RLDS dataset"
-    )
-    
-    # Model and data
-    parser.add_argument("--ckpt", required=True, help="Path to model checkpoint")
-    parser.add_argument("--builder_dir", required=True, help="Path to TFDS builder directory")
-    parser.add_argument("--split", default="train", help="Dataset split")
-    parser.add_argument("--episode_index", type=int, default=0, help="Starting episode index")
-    parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes to evaluate")
-    
-    # Keys (raw TFDS keys before transform)
-    parser.add_argument("--base_key", default="base_rgb", help="Base camera key in TFDS")
-    parser.add_argument("--wrist_key", default="hand_rgb", help="Wrist camera key in TFDS")
-    parser.add_argument("--qpos_key", default="qpos", help="Joint position key in TFDS")
-    
-    # Model settings
-    parser.add_argument("--unnorm_key", default="lohrbench_rlds", help="Unnormalization key")
-    parser.add_argument("--device", default="cuda:0", help="Device to use")
-    parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
-    parser.add_argument("--attn_impl", default="sdpa", help="Attention implementation")
-    
-    # Evaluation settings
-    parser.add_argument("--max_steps", type=int, default=1000, help="Max steps per episode")
-    parser.add_argument("--print_first_k", type=int, default=5, help="Print first K steps")
-    
-    # Output
-    parser.add_argument("--out_dir", default="./eval_results", help="Output directory")
-    parser.add_argument("--save_images", action="store_true", help="Save sample images")
-    parser.add_argument("--img_stride", type=int, default=5, help="Image save stride")
-    parser.add_argument("--img_max_frames", type=int, default=30, help="Max frames to save")
-
-    args = parser.parse_args()
-
-    # Setup
-    torch_dtype = {
-        "bf16": torch.bfloat16,
-        "fp16": torch.float16,
-        "fp32": torch.float32,
-    }[args.dtype]
     os.makedirs(args.out_dir, exist_ok=True)
 
-    print("=" * 80)
-    print("OpenVLA-OFT Evaluation on Lohrbench RLDS")
-    print("=" * 80)
-    print(f"Checkpoint: {args.ckpt}")
-    print(f"Dataset: {args.builder_dir}")
-    print(f"Split: {args.split}")
-    print(f"Episodes: {args.episode_index} to {args.episode_index + args.num_episodes - 1}")
-    print(f"Device: {args.device} | Dtype: {args.dtype}")
-    print(f"Output: {args.out_dir}")
-    print("=" * 80)
+    cfg = EvalConfig(args)
 
-    # Load dataset
+    print("=" * 90)
+    print("OpenVLA Evaluation (LoRA + L1Regression head)")
+    print("=" * 90)
+    print(f"ckpt: {args.ckpt}")
+    print(f"step: {step}")
+    print(f"builder_dir: {args.builder_dir}")
+    print(f"split: {args.split}")
+    print(f"episodes: {args.episode_index}..{args.episode_index + args.num_episodes - 1}")
+    print(f"num_images_in_input: {args.num_images_in_input}")
+    print(f"use_proprio: {args.use_proprio} (finetune.py default was False)")
+    print(f"use_film: {args.use_film} (finetune.py default was False)")
+    print(f"merge_lora: {args.merge_lora}")
+    print("=" * 90)
+
+    vla, processor, action_head, proprio_projector = load_model_and_modules(cfg, step=step, merge_lora=args.merge_lora)
+
     print("\n📂 Loading dataset...")
     builder = tfds.builder_from_directory(args.builder_dir)
     ds = builder.as_dataset(split=args.split, shuffle_files=False)
 
-    # Load model
-    print(f"\n🤖 Loading model from {args.ckpt}...")
-    processor = AutoProcessor.from_pretrained(args.ckpt, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
-        args.ckpt,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch_dtype,
-        attn_implementation=args.attn_impl,
-    ).to(args.device)
-    vla.eval()
-
-    # Critical: set num_images_in_input=1 for packed 6-channel observation
-    ok = try_set_num_images_in_input(vla, 1)
-    print(f"✓ set_num_images_in_input(1): {ok}")
-
-    # Evaluate episodes
-    all_gt = []
-    all_pred = []
+    all_gt, all_pred = [], []
 
     for ep_idx in range(args.episode_index, args.episode_index + args.num_episodes):
-        print(f"\n{'=' * 80}")
-        print(f"Episode {ep_idx}")
-        print(f"{'=' * 80}")
-
-        # Load episode
+        print(f"\n{'='*80}\nEpisode {ep_idx}\n{'='*80}")
         ep = next(iter(ds.skip(ep_idx).take(1)))
         steps_list = list(ep["steps"].as_numpy_iterator())
-
         if len(steps_list) < 2:
-            print(f"⚠ Episode {ep_idx} too short ({len(steps_list)} steps), skipping")
+            print(f"⚠ Episode too short ({len(steps_list)}). Skipping.")
             continue
+        steps_list = steps_list[:-1]  # drop last dummy
+        print(f"Episode length: {len(steps_list)}")
 
-        # Drop last dummy step (matches transform)
-        steps_list = steps_list[:-1]
-        print(f"📊 Episode length: {len(steps_list)} steps (after dropping last)")
+        instruction = decode_text(steps_list[0]["language_instruction"])
+        print("Instruction:", instruction)
 
-        # Evaluate
-        gt_arr, pred_arr, base_frames, wrist_frames = evaluate_episode(
-            vla=vla,
-            processor=processor,
-            steps_list=steps_list,
-            device=args.device,
-            torch_dtype=torch_dtype,
-            unnorm_key=args.unnorm_key,
-            max_steps=args.max_steps,
-            print_first_k=args.print_first_k,
-            save_imgs=args.save_images,
-        )
+        gt_list, pred_list = [], []
+        base_frames, wrist_frames = [], []
+
+        T = min(len(steps_list), args.max_steps)
+        for t in range(T):
+            step_d = steps_list[t]
+            obs_raw = step_d["observation"]
+
+            base_np = uint8_image(obs_raw["base_rgb"])
+            wrist_np = uint8_image(obs_raw["hand_rgb"])
+
+            if args.save_images:
+                base_frames.append(base_np)
+                wrist_frames.append(wrist_np)
+
+            # Proprio/state (only if cfg.use_proprio)
+            state = pack_state_from_qpos(obs_raw["qpos"])  # (8,)
+
+            # Ground truth action can be either (8,) or (8,8) flattened
+            act = np.asarray(step_d["action"], dtype=np.float32).reshape(-1)
+            if act.size == ACTION_DIM:
+                gt = act
+            elif act.size == NUM_ACTIONS_CHUNK * ACTION_DIM:
+                gt = act.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)[0]
+            else:
+                raise ValueError(f"Unexpected action size {act.size}; expected 8 or 64.")
+
+            obs = {
+                "full_image": base_np,
+                "wrist_image": wrist_np,
+                "state": state,
+            }
+
+            # IMPORTANT: pass action_head (+ proprio_projector if used) so we actually use the trained head
+            action_chunk = get_action(
+                cfg=cfg,
+                model=vla,
+                obs=obs,
+                task_label=instruction,
+                processor=processor,
+                action_head=action_head,
+                proprio_projector=proprio_projector,
+                noisy_action_projector=None,
+                use_film=cfg.use_film,
+            )
+
+            # action_chunk can be list or np array
+            if isinstance(action_chunk, list):
+                pred0 = np.asarray(action_chunk[0], dtype=np.float32).reshape(-1)
+            else:
+                arr = np.asarray(action_chunk, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[0] == NUM_ACTIONS_CHUNK:
+                    pred0 = arr[0]
+                else:
+                    pred0 = arr.reshape(-1)
+
+            if t == 0:
+                print("\nFirst step sanity check:")
+                summarize_vec("  gt", gt)
+                summarize_vec("  pred", pred0)
+                print("  gt:", np.round(gt, 3))
+                print("  pr:", np.round(pred0, 3))
+                print("  |err|:", np.round(np.abs(pred0 - gt), 3))
+
+            gt_list.append(gt)
+            pred_list.append(pred0)
+
+        gt_arr = np.stack(gt_list, 0)
+        pred_arr = np.stack(pred_list, 0)
+
+        ep_dir = os.path.join(args.out_dir, f"episode_{ep_idx:03d}")
+        os.makedirs(ep_dir, exist_ok=True)
+        np.save(os.path.join(ep_dir, "gt.npy"), gt_arr)
+        np.save(os.path.join(ep_dir, "pred.npy"), pred_arr)
+        plot_debug(gt_arr, pred_arr, os.path.join(ep_dir, "plots"))
+
+        if args.save_images:
+            save_images(base_frames, wrist_frames, os.path.join(ep_dir, "images"),
+                        stride=args.img_stride, max_frames=args.img_max_frames)
+
+        print("\nEpisode error summary:")
+        print_error_summary(gt_arr, pred_arr)
 
         all_gt.append(gt_arr)
         all_pred.append(pred_arr)
 
-        # Per-episode summary
-        print(f"\n📈 Episode {ep_idx} summary:")
-        summarize_vec("  GT actions", gt_arr)
-        summarize_vec("  Predicted actions", pred_arr)
-        print_error_summary(gt_arr, pred_arr)
+    if all_gt:
+        all_gt = np.concatenate(all_gt, 0)
+        all_pred = np.concatenate(all_pred, 0)
+        print(f"\n{'='*80}\nAGGREGATE ({all_gt.shape[0]} steps)\n{'='*80}")
+        print_error_summary(all_gt, all_pred)
 
-        # Save episode results
-        ep_dir = os.path.join(args.out_dir, f"episode_{ep_idx:03d}")
-        os.makedirs(ep_dir, exist_ok=True)
-
-        np.save(os.path.join(ep_dir, "gt.npy"), gt_arr)
-        np.save(os.path.join(ep_dir, "pred.npy"), pred_arr)
-
-        plot_dir = os.path.join(ep_dir, "plots")
-        plot_debug(gt_arr, pred_arr, plot_dir)
-
-        if args.save_images and len(base_frames) > 0:
-            img_dir = os.path.join(ep_dir, "images")
-            save_images(
-                base_frames,
-                wrist_frames,
-                img_dir,
-                stride=args.img_stride,
-                max_frames=args.img_max_frames,
-            )
-
-    # Aggregate results
-    if len(all_gt) > 0:
-        print(f"\n{'=' * 80}")
-        print(f"AGGREGATE RESULTS ({len(all_gt)} episodes)")
-        print(f"{'=' * 80}")
-
-        all_gt_concat = np.concatenate(all_gt, axis=0)
-        all_pred_concat = np.concatenate(all_pred, axis=0)
-
-        summarize_vec("All GT actions", all_gt_concat)
-        summarize_vec("All predicted actions", all_pred_concat)
-        print_error_summary(all_gt_concat, all_pred_concat)
-
-        np.save(os.path.join(args.out_dir, "all_gt.npy"), all_gt_concat)
-        np.save(os.path.join(args.out_dir, "all_pred.npy"), all_pred_concat)
-
-    print(f"\n✅ Evaluation complete! Results saved to: {args.out_dir}")
-    print("=" * 80)
+    print(f"\n✅ Done. Results in: {args.out_dir}")
 
 
 if __name__ == "__main__":
