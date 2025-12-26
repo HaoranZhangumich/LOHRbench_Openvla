@@ -11,8 +11,8 @@ This script:
 Example:
 export OPENVLA_ROOT="/home/haoran-zhang/openvla/LOHRbench_Openvla/openvla-oft"
 
-TF_FORCE_GPU_ALLOW_GROWTH=true CUDA_VISIBLE_DEVICES=0 python evaluate_openvla_lora_l1.py \
-  --ckpt /home/haoran-zhang/openvla/LOHRbench_Openvla/openvla-oft/openvla/openvla-7b+lohrbench_rlds+b8+lr-0.0005+lora-r32+dropout-0.0--lohrbench_lora_r32_bs2x1_ga32--50000_chkpt \
+TF_FORCE_GPU_ALLOW_GROWTH=true CUDA_VISIBLE_DEVICES=0 python evaluate_openvla_debug.py \
+  --ckpt /home/haoran-zhang/openvla/LOHRbench_Openvla/openvla-oft/openvla/openvla-7b+lohrbench_rlds+b8+lr-0.0005+lora-r32+dropout-0.0--lohrbench_lora_r32_bs2x1_ga32--90000_chkpt \
   --builder_dir /home/haoran-zhang/data/Lohrbench_rlds/lohrbench_rlds/lohrbench_rlds/0.1.0 \
   --split train \
   --episode_index 371 \
@@ -21,7 +21,7 @@ TF_FORCE_GPU_ALLOW_GROWTH=true CUDA_VISIBLE_DEVICES=0 python evaluate_openvla_lo
   --out_dir ./eval_results_debug \
   --num_images_in_input 2 \
   --merge_lora \
-  --step 50000
+  --step 90000
 """
 
 from __future__ import annotations
