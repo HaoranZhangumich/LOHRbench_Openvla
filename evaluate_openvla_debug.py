@@ -12,8 +12,8 @@ Example:
 export OPENVLA_ROOT="/home/haoran-zhang/openvla/LOHRbench_Openvla/openvla-oft"
 
 TF_FORCE_GPU_ALLOW_GROWTH=true CUDA_VISIBLE_DEVICES=0 python evaluate_openvla_debug.py \
-  --ckpt /home/haoran-zhang/openvla/LOHRbench_Openvla/openvla-oft/openvla/openvla-7b+lohrbench_rlds+b8+lr-0.0005+lora-r32+dropout-0.0--lohrbench_lora_r32_bs2x1_ga32--90000_chkpt \
-  --builder_dir /home/haoran-zhang/data/Lohrbench_rlds/lohrbench_rlds/lohrbench_rlds/0.1.0 \
+  --ckpt /data/haoran/openvla_runs/openvla-7b+lohrbench_rlds+b8+lr-0.0005+lora-r32+dropout-0.0--image_aug--lohrbench_lora_r32_bs8_ga1_proprio_image_aug--150000_chkpt  \
+  --builder_dir /data1/LoHRbench_rlds/lohrbench_rlds/lohrbench_rlds/0.1.0  \
   --split train \
   --episode_index 371 \
   --num_episodes 1 \
@@ -21,7 +21,8 @@ TF_FORCE_GPU_ALLOW_GROWTH=true CUDA_VISIBLE_DEVICES=0 python evaluate_openvla_de
   --out_dir ./eval_results_debug \
   --num_images_in_input 2 \
   --merge_lora \
-  --step 90000
+  --step 150000 \
+  --use_proprio
 """
 
 from __future__ import annotations
@@ -69,6 +70,14 @@ def find_openvla_root() -> str:
 OPENVLA_ROOT = find_openvla_root()
 sys.path.insert(0, OPENVLA_ROOT)
 print(f"✓ Added to Python path: {OPENVLA_ROOT}")
+
+# 🚨 CRITICAL FIX: Force LOHRBENCH constants to be loaded
+# The constants.py file detects platform from sys.argv
+# Without "lohrbench" in the command, it defaults to LIBERO (ACTION_DIM=7)
+# This causes the gripper action (dim 7) to be DISCARDED!
+if "lohrbench" not in " ".join(sys.argv).lower():
+    sys.argv.append("--dataset_name=lohrbench_rlds")
+    print("⚠️  Added 'lohrbench_rlds' to sys.argv to force correct constants")
 
 # Repo utils (these avoid the processor batching issues you hit)
 from experiments.robot.openvla_utils import (  # noqa: E402
@@ -253,7 +262,7 @@ def load_model_and_modules(cfg: EvalConfig, step: int, merge_lora: bool):
     vla.eval()
 
     processor = get_processor(cfg)
-
+    # breakpoint()
     # Load action_head (CRITICAL for your training setup)
     torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[cfg.dtype]
     action_head = L1RegressionActionHead(
